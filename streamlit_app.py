@@ -1,125 +1,26 @@
 # -*- coding: utf-8 -*-
-# streamlit_app.py
-# Image Spoofer (Streamlit) — Normal / BW / BW contrasté / Golden Hour (+ Miroir x2 optionnel)
-# Export en ZIP (arborescence ou tout à la racine).
-#
-# UI :
-# - Uploader multiple (drag & drop), sélection d’une image pour aperçu
-# - Rotation par image, miroir aperçu, zoom d’aperçu
-# - Cases à cocher pour variantes export
-# - Redimensionnement (%), sRGB+strip, strip metadata
-# - "Miroir x2 à l’export", "Tout dans un seul dossier"
-# - Bouton "Exporter" → génère un ZIP téléchargeable (sans écrire sur disque)
+# streamlit_video_app.py
+# Video Spoofer (Streamlit) — Normal / BW / BW contrasté / Golden Hour (+ Miroir x2 optionnel)
+# Export en ZIP (arborescence /Nom/Normal + /Nom/Miroir, ou tout à la racine).
 #
 # Notes :
-# - pillow-heif est optionnel (HEIC/HEIF). Si absent, ces formats ne seront pas lisibles.
-# - L’export choisit JPEG si source jpg/jpeg, sinon PNG.
+# - Requiert ffmpeg (présent sur Streamlit Community Cloud en général).
+# - Encodage H.264 (libx264) + AAC. Conteneur .mp4
+# - Les effets sont appliqués frame-par-frame via PIL, donc le temps de rendu dépend de la durée/résolution.
 
-import os, io, zipfile
+import os, io, zipfile, tempfile
 from typing import List, Tuple, Dict, Optional, Iterable
+
+import numpy as np
 from PIL import Image, ImageOps, ImageEnhance
-
 import streamlit as st
+from moviepy.editor import VideoFileClip, vfx
 
-# ---------- Optionnels ----------
-HEIF_OK = False
-try:
-    import pillow_heif  # type: ignore
-    pillow_heif.register_heif_opener()
-    HEIF_OK = True
-except Exception:
-    HEIF_OK = False
+# ---------- Config ----------
+SUPPORTED_VIDS = {'.mp4', '.mov', '.m4v', '.webm'}
+ALLOWED_ROTATIONS = (0, 90, 180, 270)
 
-CMS_OK = True
-try:
-    from PIL import ImageCms
-except Exception:
-    CMS_OK = False
-
-# ---------- Resampling ----------
-try:
-    LANCZOS = Image.Resampling.LANCZOS
-    BICUBIC = Image.Resampling.BICUBIC
-except Exception:
-    LANCZOS = Image.LANCZOS
-    BICUBIC = Image.BICUBIC
-
-SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp', '.heic', '.heif'}
-
-# ---------- Helpers (reprennent ta logique) ----------
-def is_heif(name: str) -> bool:
-    return os.path.splitext(name)[1].lower() in {'.heic', '.heif'}
-
-def open_image_high_fidelity(file) -> Image.Image:
-    """
-    file: st.uploaded_file (possède .read() / .getvalue()) ou bytes
-    """
-    if hasattr(file, "read"):
-        data = file.read()
-    elif isinstance(file, (bytes, bytearray)):
-        data = file
-    else:
-        raise RuntimeError("Type de fichier non supporté.")
-    buf = io.BytesIO(data)
-    img = Image.open(buf)
-    if img.mode not in ("RGB", "RGBA", "L"):
-        img = img.convert("RGB")
-    return img
-
-def choose_output_format(src_name: str) -> Tuple[str, str]:
-    ext = os.path.splitext(src_name)[1].lower()
-    if ext in {'.jpg', '.jpeg'}: return '.jpg', 'JPEG'
-    return '.png', 'PNG'
-
-def safe_save_to_bytes(img: Image.Image, pil_format: str,
-                       strip: bool = True,
-                       orig_exif: Optional[bytes] = None,
-                       orig_icc: Optional[bytes] = None) -> bytes:
-    """
-    Sauvegarde en mémoire (bytes). Conserve exif/icc si strip=False.
-    """
-    out = io.BytesIO()
-    kwargs = {}
-    if not strip:
-        if orig_exif and pil_format == 'JPEG':
-            kwargs['exif'] = orig_exif
-        if orig_icc:
-            kwargs['icc_profile'] = orig_icc
-
-    if pil_format == 'JPEG':
-        img = img.convert('RGB')
-        img.save(out, format='JPEG', quality=100, optimize=True, subsampling=0, progressive=True, **kwargs)
-    elif pil_format == 'PNG':
-        if strip:
-            from PIL.PngImagePlugin import PngInfo
-            pnginfo = PngInfo()
-            img.save(out, format='PNG', pnginfo=pnginfo, compress_level=0, **kwargs)
-        else:
-            img.save(out, format='PNG', compress_level=0, **kwargs)
-    else:
-        img.save(out, format=pil_format, **kwargs)
-    return out.getvalue()
-
-def apply_rotation(img: Image.Image, deg: int) -> Image.Image:
-    deg = int(deg) % 360
-    if deg == 0: return img
-    return img.rotate(deg, expand=True, resample=BICUBIC)
-
-def apply_mirror(img: Image.Image, enabled: bool) -> Image.Image:
-    return ImageOps.mirror(img) if enabled else img
-
-def convert_to_srgb_pixels(img: Image.Image, src_icc: Optional[bytes]) -> Image.Image:
-    try:
-        if CMS_OK and src_icc:
-            in_prof = ImageCms.ImageCmsProfile(io.BytesIO(src_icc))
-            out_prof = ImageCms.createProfile("sRGB")
-            converted = ImageCms.profileToProfile(img, in_prof, out_prof, outputMode='RGB')
-            return converted.convert('RGB')
-    except Exception:
-        pass
-    return img.convert('RGB')
-
-# ---- Effets ----
+# ---------- Effets (sur frame PIL) ----------
 def effect_normal(img: Image.Image) -> Image.Image:
     return img
 
@@ -144,7 +45,7 @@ def effect_golden_hour(img: Image.Image) -> Image.Image:
     warmed = ImageEnhance.Brightness(warmed).enhance(1.03)
     return warmed
 
-def apply_effect_pipeline(img: Image.Image, pipeline: Iterable[str]) -> Image.Image:
+def apply_effect_pipeline_pil(img: Image.Image, pipeline: Iterable[str]) -> Image.Image:
     out = img
     for step in pipeline:
         if step == "normal":
@@ -177,31 +78,63 @@ def choose_preview_pipeline(e_normal: bool, e_bw: bool, e_bwc: bool, e_gh: bool)
     if e_normal: return ["normal"]
     return ["normal"]
 
-# ---------- Session state ----------
+# ---------- Frame mapper (numpy <-> PIL) ----------
+def frame_mapper_factory(pipeline: List[str], mirror: bool) :
+    """
+    Retourne une fonction f(frame: np.ndarray) -> np.ndarray
+    frame: HxWx3 uint8
+    """
+    def mapper(frame: np.ndarray) -> np.ndarray:
+        img = Image.fromarray(frame)
+        if mirror:
+            img = ImageOps.mirror(img)
+        img = apply_effect_pipeline_pil(img, pipeline)
+        return np.array(img)
+    return mapper
+
+# ---------- Clip processing ----------
+def process_clip(
+    clip: VideoFileClip,
+    pipeline: List[str],
+    mirror: bool,
+    rotate_deg: int,
+    resize_pct: int
+) -> VideoFileClip:
+    # Rotation (MoviePy applique rotation "visuelle")
+    if rotate_deg in ALLOWED_ROTATIONS and rotate_deg != 0:
+        clip = clip.fx(vfx.rotate, angle=rotate_deg)  # angle en degrés
+
+    # Resize
+    if resize_pct != 100:
+        clip = clip.fx(vfx.resize, resize_pct / 100.0)
+
+    # Effets + miroir (par frame)
+    mapper = frame_mapper_factory(pipeline, mirror)
+    clip = clip.fl_image(mapper)
+
+    return clip
+
+# ---------- App ----------
+st.set_page_config(page_title="Photo / Video Spoofer", page_icon="🎬", layout="wide")
+st.title("🎬 Grumtor's Spoofer — Photo / Video")
+
+# Session
 if "rotation_map" not in st.session_state:
     st.session_state.rotation_map: Dict[str, int] = {}
-if "mirror_preview" not in st.session_state:
-    st.session_state.mirror_preview = False
 if "selected_name" not in st.session_state:
     st.session_state.selected_name: Optional[str] = None
 if "last_uploaded_names" not in st.session_state:
     st.session_state.last_uploaded_names: List[str] = []
 
-# ---------- UI ----------
-st.set_page_config(page_title="SPOOFER (Streamlit)", page_icon="🖼️", layout="wide")
-st.title("SPOOFER — Image Spoofer (Streamlit)")
-
 with st.sidebar:
     st.header("Fichiers")
-    files = st.file_uploader(
-        "Glissez-déposez vos images (multi)",
-        type=[e.strip(".") for e in SUPPORTED_EXTS],
+    vids = st.file_uploader(
+        "Glissez-déposez vos vidéos (multi)",
+        type=[e.strip(".") for e in SUPPORTED_VIDS],
         accept_multiple_files=True
     )
-    st.caption("Formats: JPG, PNG, BMP, TIF(F), WEBP, HEIC/HEIF (si pillow-heif installé)")
+    names = [v.name for v in vids] if vids else []
 
-    names = [f.name for f in files] if files else []
-    # Reset rotations si nouvel upload
     if names != st.session_state.last_uploaded_names:
         st.session_state.last_uploaded_names = names
         st.session_state.rotation_map = {n: 0 for n in names}
@@ -210,18 +143,20 @@ with st.sidebar:
 
     if names:
         st.write(f"**{len(names)} fichiers**")
-        selected_name = st.selectbox("Aperçu du fichier", options=names, index=names.index(st.session_state.selected_name) if st.session_state.selected_name in names else 0)
+        selected_name = st.selectbox(
+            "Aperçu / réglages du fichier",
+            options=names,
+            index=names.index(st.session_state.selected_name) if st.session_state.selected_name in names else 0
+        )
         st.session_state.selected_name = selected_name
 
-        colr1, colr2, colr3 = st.columns([1,1,1])
+        colr1, colr2 = st.columns(2)
         with colr1:
-            if st.button("⟲ -90°"):
+            if st.button("⟲ 90° CCW"):
                 st.session_state.rotation_map[selected_name] = (st.session_state.rotation_map.get(selected_name, 0) - 90) % 360
         with colr2:
-            if st.button("⟳ +90°"):
+            if st.button("⟳ 90° CW"):
                 st.session_state.rotation_map[selected_name] = (st.session_state.rotation_map.get(selected_name, 0) + 90) % 360
-        with colr3:
-            st.toggle("Miroir (aperçu)", key="mirror_preview")
 
     st.divider()
     st.header("Réglages export")
@@ -229,10 +164,6 @@ with st.sidebar:
     flat_export = st.checkbox("Tout dans un seul dossier")
     resize_export = st.checkbox("Redimensionner (%)")
     export_scale_pct = st.slider("Taille export (%)", 10, 200, 100, 1, disabled=not resize_export)
-    strip_metadata = st.checkbox("Supprimer toutes les métadonnées", value=True)
-    convert_srgb_then_strip = st.checkbox("sRGB puis retirer l’ICC", value=False, disabled=not CMS_OK)
-
-    st.caption("Astuce : activer sRGB garantit des couleurs cohérentes sur le web. Si cochée, l’ICC sera retiré.")
 
     st.divider()
     st.header("Effets à exporter")
@@ -243,48 +174,70 @@ with st.sidebar:
     variants = generate_variants(eff_normal, eff_bw, eff_bwc, eff_gh)
 
     # Compteur d'export
-    count_imgs = len(names)
+    count_vids = len(names)
     mirror_states_count = (2 if mirror_all else 1)
-    total_exports = count_imgs * mirror_states_count * max(1, len(variants))
+    total_exports = count_vids * mirror_states_count * max(1, len(variants))
     st.markdown(f"**À exporter : {total_exports}**")
 
 # ---------- Preview ----------
 col_left, col_right = st.columns([5,5], gap="large")
 
 with col_left:
-    st.subheader("Aperçu")
-    if files and st.session_state.selected_name:
-        file = next((f for f in files if f.name == st.session_state.selected_name), None)
+    st.subheader("Aperçu (image clé rapide)")
+    if vids and st.session_state.selected_name:
+        vfile = next((f for f in vids if f.name == st.session_state.selected_name), None)
         try:
-            if file:
-                # On ne consomme pas définitivement le buffer de l'UploadedFile
-                bytes_for_preview = file.getvalue()
-                img = Image.open(io.BytesIO(bytes_for_preview))
-                angle = st.session_state.rotation_map.get(file.name, 0)
-                img = apply_rotation(img, angle)
-                img = apply_mirror(img, st.session_state.mirror_preview)
+            if vfile:
+                # On ouvre depuis un fichier temporaire pour MoviePy
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(vfile.name)[1]) as tmp:
+                    tmp.write(vfile.getvalue())
+                    tmp_path = tmp.name
 
-                pipeline = choose_preview_pipeline(eff_normal, eff_bw, eff_bwc, eff_gh)
-                img = apply_effect_pipeline(img, pipeline)
+                angle = st.session_state.rotation_map.get(vfile.name, 0)
+                preview_pipeline = choose_preview_pipeline(eff_normal, eff_bw, eff_bwc, eff_gh)
 
-                zoom = st.slider("Zoom aperçu", 25, 200, 100, 5)
-                w, h = img.size
-                new_w = max(1, int(w * (zoom/100.0)))
-                new_h = max(1, int(h * (zoom/100.0)))
-                if (new_w, new_h) != (w, h):
-                    img = img.resize((new_w, new_h), resample=LANCZOS)
+                with VideoFileClip(tmp_path) as clip:
+                    # On prend un frame au milieu
+                    t = max(0, clip.duration/2.0 if clip.duration else 0.0)
+                    frame = clip.get_frame(t)  # numpy HxWx3
+                    # Applique rotation + resize + miroir aperçu ? → On suit réglages export hors "miroir x2"
+                    # On garde miroir= False pour l’aperçu (le switch x2 est à l’export)
+                    # Redimension pour l’aperçu (optionnel, ici on n'applique pas pour ne pas dégrader l’aperçu)
+                    img = Image.fromarray(frame)
 
-                st.image(img, caption=f"{file.name} | {w}×{h}px | Rot {angle}° | Mir {'ON' if st.session_state.mirror_preview else 'OFF'} | {''.join(pipeline)}", use_column_width=True)
+                    # rotation
+                    if angle in ALLOWED_ROTATIONS and angle != 0:
+                        # PIL rotate positive angle is CCW
+                        rot_map = {90: 90, 180: 180, 270: 270}  # direct
+                        img = img.rotate(rot_map[angle], expand=True)
+
+                    img = apply_effect_pipeline_pil(img, preview_pipeline)
+
+                    # Rendu
+                    zoom = st.slider("Zoom aperçu", 25, 200, 100, 5)
+                    w, h = img.size
+                    new_w = max(1, int(w * (zoom/100.0)))
+                    new_h = max(1, int(h * (zoom/100.0)))
+                    if (new_w, new_h) != (w, h):
+                        img = img.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
+
+                    st.image(img, caption=f"{vfile.name} | Rot {angle}° | Aperçu {''.join(preview_pipeline)}", use_column_width=True)
         except Exception as e:
             st.error(f"Erreur aperçu: {e}")
     else:
-        st.info("Ajoutez des images dans la barre latérale pour afficher l’aperçu.")
+        st.info("Ajoutez des vidéos dans la barre latérale pour afficher un aperçu.")
 
 with col_right:
     st.subheader("Export")
-    if not files:
-        st.warning("Ajoutez au moins une image.")
+    if not vids:
+        st.warning("Ajoutez au moins une vidéo.")
     else:
+        # Paramètres d'encodage
+        st.caption("Encodage: H.264 + AAC (MP4)")
+        crf = st.slider("Qualité (CRF H.264, plus bas = meilleure qualité)", 16, 28, 20, 1)
+        preset = st.selectbox("Preset ffmpeg", ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"], index=5)
+        keep_audio = st.checkbox("Conserver l'audio", value=True)
+
         do_export = st.button("⟱ Exporter en ZIP")
         if do_export:
             try:
@@ -293,72 +246,88 @@ with col_right:
 
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_STORED) as zf:
-                    # Préparation des options
-                    do_srgb = bool(convert_srgb_then_strip)
-                    do_resize = bool(resize_export)
-                    scale_pct = max(10, min(200, int(export_scale_pct))) / 100.0
-                    do_strip = bool(strip_metadata or convert_srgb_then_strip)
-
-                    mirror_states = [False, True] if mirror_all else [st.session_state.mirror_preview]
-                    total_ops = len(files) * len(mirror_states) * len(variants)
+                    mirror_states = [False, True] if mirror_all else [False]
+                    total_ops = len(vids) * len(mirror_states) * len(variants)
                     done = 0
 
-                    for f in files:
-                        # lecture bytes sans consommer file pour d'autres usages
-                        raw = f.getvalue()
-                        src = Image.open(io.BytesIO(raw))
-                        src_icc = src.info.get('icc_profile')
-                        src_exif = src.info.get('exif')
-                        base = os.path.splitext(os.path.basename(f.name))[0]
-                        out_ext, pil_fmt = choose_output_format(f.name)
+                    for vfile in vids:
+                        base = os.path.splitext(os.path.basename(vfile.name))[0]
+                        angle = st.session_state.rotation_map.get(vfile.name, 0)
+                        scale_pct = int(export_scale_pct) if resize_export else 100
 
-                        angle = st.session_state.rotation_map.get(f.name, 0)
-                        if angle not in (0, 90, 180, 270):
-                            angle = 0
+                        # Sauvegarde l'upload dans un temp file pour MoviePy/ffmpeg
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(vfile.name)[1]) as src_tmp:
+                            src_tmp.write(vfile.getvalue())
+                            src_path = src_tmp.name
 
-                        for mstate in mirror_states:
-                            for pipeline in variants:
-                                img = Image.open(io.BytesIO(raw))
-                                img = apply_rotation(img, angle)
-                                img = apply_mirror(img, mstate)
-                                img = apply_effect_pipeline(img, pipeline)
+                        # Ouvre clip source une seule fois
+                        with VideoFileClip(src_path, audio=keep_audio) as src_clip:
+                            fps = src_clip.fps or 25
 
-                                if do_srgb:
-                                    img = convert_to_srgb_pixels(img, src_icc)
+                            for mstate in mirror_states:
+                                for pipeline in variants:
+                                    suf = ""
+                                    if angle in ALLOWED_ROTATIONS and angle != 0:
+                                        suf += f"_rot{angle}"
+                                    if flat_export and mstate:
+                                        suf += "_mir"
+                                    suf += variant_suffix(pipeline)
+                                    if scale_pct != 100:
+                                        suf += f"_{scale_pct}pct"
 
-                                if do_resize and scale_pct != 1.0:
-                                    w, h = img.size
-                                    img = img.resize((max(1,int(w*scale_pct)), max(1,int(h*scale_pct))), resample=LANCZOS)
+                                    out_name = f"{base}{suf}.mp4"
+                                    arcdir = "" if flat_export else os.path.join(base, "Miroir" if mstate else "Normal")
+                                    arcname = out_name if not arcdir else os.path.join(arcdir, out_name)
 
-                                suf = ""
-                                if angle: suf += f"_rot{angle}"
-                                if flat_export and mstate:
-                                    suf += "_mir"
-                                suf += variant_suffix(pipeline)
-                                if do_resize and scale_pct != 1.0:
-                                    suf += f"_{int(scale_pct*100)}pct"
+                                    # Traite le clip
+                                    proc = process_clip(
+                                        clip=src_clip,
+                                        pipeline=pipeline,
+                                        mirror=mstate,
+                                        rotate_deg=angle if angle in ALLOWED_ROTATIONS else 0,
+                                        resize_pct=scale_pct
+                                    )
 
-                                # Chemin dans le ZIP
-                                if flat_export:
-                                    arcdir = ""
-                                else:
-                                    arcdir = os.path.join(base, "Miroir" if mstate else "Normal")
+                                    # Ecrit vers un fichier temp (MoviePy requiert un chemin)
+                                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as dst_tmp:
+                                        dst_path = dst_tmp.name
 
-                                out_name = f"{base}{suf}{out_ext}"
-                                arcname = out_name if not arcdir else os.path.join(arcdir, out_name)
+                                    # Export ffmpeg
+                                    # audio on/off, bitrate laissé à ffmpeg avec crf/preset
+                                    audio_codec = "aac" if keep_audio and src_clip.audio is not None else None
+                                    proc.write_videofile(
+                                        dst_path,
+                                        codec="libx264",
+                                        audio=audio_codec is not None,
+                                        audio_codec=audio_codec if audio_codec else "aac",
+                                        fps=fps,
+                                        preset=preset,
+                                        ffmpeg_params=["-crf", str(crf)],
+                                        verbose=False,
+                                        logger=None
+                                    )
+                                    proc.close()
 
-                                # Écriture dans le zip
-                                data = safe_save_to_bytes(
-                                    img, pil_fmt,
-                                    strip=do_strip,
-                                    orig_exif=src_exif,
-                                    orig_icc=src_icc
-                                )
-                                zf.writestr(arcname, data)
+                                    # Ajoute au ZIP
+                                    with open(dst_path, "rb") as f:
+                                        data = f.read()
+                                        zf.writestr(arcname, data)
 
-                                done += 1
-                                progress.progress(min(1.0, done / max(1, total_ops)))
-                                status.write(f"Export: {arcname}")
+                                    # Nettoyage du temp out
+                                    try:
+                                        os.remove(dst_path)
+                                    except Exception:
+                                        pass
+
+                                    done += 1
+                                    progress.progress(min(1.0, done / max(1, total_ops)))
+                                    status.write(f"Export: {arcname}")
+
+                        # Nettoyage du temp in
+                        try:
+                            os.remove(src_path)
+                        except Exception:
+                            pass
 
                 progress.progress(1.0)
                 status.write("Export terminé ! Téléchargez ci-dessous.")
@@ -366,13 +335,8 @@ with col_right:
                 st.download_button(
                     label="⬇️ Télécharger le ZIP",
                     data=zip_buf,
-                    file_name="spoofer_export.zip",
+                    file_name="video_spoofer_export.zip",
                     mime="application/zip"
                 )
             except Exception as e:
                 st.error(f"Erreurs lors de l'export : {e}")
-
-st.caption(
-    f"HEIC/HEIF activé: {'✅' if HEIF_OK else '❌'} | "
-    f"sRGB (ImageCms): {'✅' if CMS_OK else '❌'}"
-)
